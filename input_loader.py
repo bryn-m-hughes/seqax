@@ -26,7 +26,7 @@ import functools
 from typing import Tuple, Union, Optional
 
 from typeguard import typechecked
-from shardlib.shardtypes import bool_, pytree_dataclass, u32
+from shardlib.shardtypes import bool_, pytree_dataclass, u32, i32, u8
 import shardlib.shardtypes as shardtypes
 import zarr
 from dataclasses import dataclass
@@ -41,6 +41,44 @@ import numpy as onp
 from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
 from datasets import load_dataset
+from tools.constants import IMG_TOKEN
+
+
+@pytree_dataclass
+class SequenceImages:
+    images: u8['l 224 224 3']
+    seq_offsets: u32['l']
+
+@pytree_dataclass
+class ImageBatch:
+    images: u8['n 224 224 3']
+    batch_indices: i32['n']
+    seq_offsets: i32['n']
+
+def generate_image_batch(sequence_images_list):
+    max_images_per_batch = 128
+
+    # Calculate the total number of images
+    n = sum(sequence.images.shape[0] for sequence in sequence_images_list if sequence is not None)
+    if n > max_images_per_batch:
+        raise ValueError(f"Too many images: {n} > {max_images_per_batch}")
+    
+    # Initialize arrays for images, seq_indices, and seq_offsets
+    images = np.zeros((max_images_per_batch, 224, 224, 3), dtype=np.uint8)
+    seq_indices = np.ones(max_images_per_batch, dtype=np.int32) * -1
+    seq_offsets = np.ones(max_images_per_batch, dtype=np.int32) * -1
+    
+    current_index = 0
+    for i, sequence in enumerate(sequence_images_list):
+        if sequence is None:
+            continue
+        num_images = sequence.images.shape[0]
+        images[current_index:current_index + num_images] = sequence.images
+        seq_indices[current_index:current_index + num_images] = i
+        seq_offsets[current_index:current_index + num_images] = sequence.seq_offsets
+        current_index += num_images
+    
+    return ImageBatch(images=images, batch_indices=seq_indices, seq_offsets=seq_offsets)
 
 @dataclass(frozen=True)
 class TokenBatchParams:
@@ -54,9 +92,7 @@ class TokenBatch:
     """A batch of tokens, which are typically the input to training."""
     targets: u32['batch/d len']
     is_seq_start: bool_['batch/d len']
-
-        
-
+    images: ImageBatch
 
 @dataclass(frozen=True)
 class FlatTokensParams:
@@ -86,6 +122,15 @@ class FlatTokensParams:
 class _ShuffleBuffer:
     minipoch: int
     buffer: u32['Buflen len']
+    images: list[Union[SequenceImages, None]]
+
+    def __getitem__(self, index: int):
+        if isinstance(index, int):
+            if index < 0 or index >= len(self.buffer):
+                raise IndexError("Index out of range")
+            return self.buffer[index], self.images[index]
+        else:
+            raise TypeError("Index must be an integer")
 
 
 class ShufflingLoader:
@@ -97,6 +142,7 @@ class ShufflingLoader:
         self.encoded_tokens = self.root[split]["encoded_tokens"]
         self.seq_starts = self.root[split]["seq_starts"]
         self.max_token_id = self.root[split].attrs["max_token_id"]
+        self.images = self.root[split]["images"]
         assert len(self.encoded_tokens.shape) == 1, "Expected 1D zarr"
         assert self.encoded_tokens.dtype == np.uint32, "Expected uint32 zarr"
         assert len(self.seq_starts.shape) == 1, "Expected 1D zarr"
@@ -159,12 +205,14 @@ class ShufflingLoader:
             seqlen_slice = indexing[1]
             examples = []
             for batch_index in range(*indexing[0].indices(self.token_batch_params.batch)):
-                examples.append(seq_by_batch_index[batch_index][seqlen_slice])
+                tokens = seq_by_batch_index[batch_index][0]
+                examples.append(tokens[seqlen_slice])
             return np.stack(examples)
 
         shape = (self.token_batch_params.batch, self.token_batch_params.len)
         encoded_tokens = jax.make_array_from_callback(shape, self.sharding, get_shard)
-        return _decode(encoded_tokens)
+        image_batch = generate_image_batch([seq[1] for seq in seq_by_batch_index.values()])
+        return _decode(encoded_tokens, image_batch)
 
 
     def _get_shuffle_buffer(self, stream: int, minipoch: int) -> _ShuffleBuffer:
@@ -189,9 +237,38 @@ class ShufflingLoader:
                 start_seq = read_block_index * self.params.sequences_per_read_block
                 end_seq = start_seq + self.params.sequences_per_read_block
                 block_shape = (self.params.sequences_per_read_block, self.token_batch_params.len)
+
+                def get_images(tokens_block):
+                    sequence_images = [[] for _ in range(self.params.sequences_per_read_block)]
+                    seq_index, seq_offset = np.where(tokens_block[:, :-1] == IMG_TOKEN)
+                    seq_offset += 1
+
+                    image_indices = tokens_block[seq_index, seq_offset] >> 1
+                    for i, image_ind in enumerate(image_indices):
+                        start_pos = image_ind * 224 * 224 * 3
+                        end_pos = start_pos + 224 * 224 * 3
+                        flat_image_segment = self.images[start_pos:end_pos]
+                        sequence_images[seq_index[i]].append((flat_image_segment.reshape((224, 224, 3)), seq_offset[i]))
+                    
+                    all_seq_images = []
+                    for seq in sequence_images:
+                        if len(seq) == 0:
+                            all_seq_images.append(None)
+                        else:
+                            image_list, seq_offsets = zip(*seq)
+                            all_seq_images.append(
+                                SequenceImages(
+                                    images=np.stack(image_list),
+                                    seq_offsets=np.array(seq_offsets)
+                                )
+                            )
+                    return all_seq_images
+
                 if self.params.sequence_packing:
                     flat_tokens = self.encoded_tokens[start_seq * self.token_batch_params.len : end_seq * self.token_batch_params.len]
-                    return flat_tokens.reshape(block_shape)
+                    reshaped_tokens = flat_tokens.reshape(block_shape)
+                    all_seq_images = get_images(reshaped_tokens)
+                    return reshaped_tokens, all_seq_images
                 else:
                     seq_starts = self.seq_starts[start_seq : end_seq + 1]
                     flat_tokens = self.encoded_tokens[seq_starts[0] : seq_starts[-1]]
@@ -203,7 +280,8 @@ class ShufflingLoader:
                         start = seq_starts[i]
                         end = seq_starts[i + 1]
                         result[i, :end - start] = flat_tokens[start:end]
-                    return result
+                    all_seq_images = get_images(result)
+                    return result, all_seq_images
             
             print(f'[{datetime.datetime.now()}] Loading shuffle buffer')
             # Loading a read block is IO-dominated work, with very little CPU time involved, so we can afford
@@ -214,8 +292,10 @@ class ShufflingLoader:
             # net, allow a lot of threads, potentially way more than we have CPUs! Other overheads will
             # bite us before thread overheads do.
             with ThreadPoolExecutor(max_workers=len(shuffled_read_block_indices)) as executor:
-                shuffled_read_blocks = list(executor.map(load_read_block, shuffled_read_block_indices))
+                shuffled_read_blocks_and_images = list(executor.map(load_read_block, shuffled_read_block_indices))
+            shuffled_read_blocks, shuffled_images = zip(*shuffled_read_blocks_and_images)
             shuffle_buffer = np.concatenate(shuffled_read_blocks, axis=0)
+            shuffled_images = sum(shuffled_images, [])
             print(f'[{datetime.datetime.now()}] Finished loading shuffle buffer, {shuffle_buffer.size * 4:_} bytes')
             
             # Actually shuffle it.
@@ -224,9 +304,10 @@ class ShufflingLoader:
             shuffle_seed = self.params.seed + 1 + minipoch * self.params.streams + stream
             permutation = _random_permutation(shuffle_seed, sequences_in_shuffle_buffer)
             shuffle_buffer = shuffle_buffer[permutation, :]
-            self.shuffle_buffers_by_stream[stream] = _ShuffleBuffer(minipoch, shuffle_buffer)
+            shuffled_images = [shuffled_images[i] for i in permutation]
+            self.shuffle_buffers_by_stream[stream] = _ShuffleBuffer(minipoch, shuffle_buffer, shuffled_images)
         
-        return self.shuffle_buffers_by_stream[stream].buffer
+        return self.shuffle_buffers_by_stream[stream]
 
 def _div_up(a: int, b: int) -> int:
     return (a + b - 1) // b
@@ -237,13 +318,14 @@ def _div_exact(a: int, b: int) -> int:
 
 @functools.partial(jax.jit, donate_argnums=(0,))
 @typechecked
-def _decode(encoded_tokens: u32[b'batch/d len']) -> TokenBatch:
+def _decode(encoded_tokens: u32[b'batch/d len'], images: ImageBatch) -> TokenBatch:
     # encoded_tokens encoding:
     #  2*id+1 for the first token in a sequence
     #  2*id for other tokens in the sequence
     return TokenBatch(
         targets = encoded_tokens >> 1,
         is_seq_start = (encoded_tokens & 1) == 1,
+        images = images
     )
 
 def _random_permutation(seed: int, n: int) -> u32['N']:

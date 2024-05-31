@@ -1,11 +1,12 @@
 import os
 
-def set_variables():
-  os.environ['XLA_FLAGS'] = (
-      os.environ.get('XLA_FLAGS', '') + ' '
-      '--xla_gpu_enable_async_collectives=true '
-      '--xla_gpu_enable_latency_hiding_scheduler=true '
-  )
+def set_variables(cpu=False):
+  if not cpu:
+    os.environ['XLA_FLAGS'] = (
+        os.environ.get('XLA_FLAGS', '') + ' '
+        '--xla_gpu_enable_async_collectives=true '
+        '--xla_gpu_enable_latency_hiding_scheduler=true '
+    )
   os.environ.update({
     "NCCL_LL128_BUFFSIZE": "-2",
     "NCCL_LL_BUFFSIZE": "-2",

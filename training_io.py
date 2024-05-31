@@ -226,22 +226,25 @@ def fsspec_put(local_src: str, remote_dst: str):
 
 def save_hlo_svg(filespec: str, compiled: jax.stages.Compiled):
   """Saves a compiled function's HLO to an SVG file."""
-  compiled_hlo_dot = xla_client._xla.hlo_module_to_dot_graph(compiled.runtime_executable().hlo_modules()[0])
-  with tempfile.TemporaryDirectory() as d:
-    with open(os.path.join(d, "hlo.dot"), "w") as f:
-      f.write(compiled_hlo_dot)
-    hlo_orig_svg = os.path.join(d, "hlo.original.svg")
-    hlo_svg = os.path.join(d, "hlo.svg")
-    os.system(f"dot -Tsvg {f.name} -o{hlo_orig_svg}")
-    # Edit the SVG to remove everything before <svg>. There's a bunch of hover CSS that massively slows down
-    # rendering in Chrome and adds little value: it just highlights edges when you hover over them.
-    with open(hlo_orig_svg, "r") as f:
-      svg = f.read()
-      svg = svg[svg.index("<svg "):]
-    with open(hlo_svg, "w") as f:
-      f.write(svg)
-    fsspec_put(hlo_svg, filespec)
-
+  try:
+    compiled_hlo_dot = xla_client._xla.hlo_module_to_dot_graph(compiled.runtime_executable().hlo_modules()[0])
+    with tempfile.TemporaryDirectory() as d:
+      with open(os.path.join(d, "hlo.dot"), "w") as f:
+        f.write(compiled_hlo_dot)
+      hlo_orig_svg = os.path.join(d, "hlo.original.svg")
+      hlo_svg = os.path.join(d, "hlo.svg")
+      # os.system(f"dot -Tsvg {f.name} -o{hlo_orig_svg} > /dev/null 2>&1")
+      os.system(f"dot -Tsvg {f.name} -o{hlo_orig_svg}")
+      # Edit the SVG to remove everything before <svg>. There's a bunch of hover CSS that massively slows down
+      # rendering in Chrome and adds little value: it just highlights edges when you hover over them.
+      with open(hlo_orig_svg, "r") as f:
+        svg = f.read()
+        svg = svg[svg.index("<svg "):]
+      with open(hlo_svg, "w") as f:
+        f.write(svg)
+      fsspec_put(hlo_svg, filespec)
+  except Exception as e:
+    print(f"Failed to save HLO SVG: {e}")
 
 def mkdir(filespec: str):
   """Creates a directory at the specified (possibly remote) fsspec path."""

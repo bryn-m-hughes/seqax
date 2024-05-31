@@ -1,0 +1,13 @@
+defaults:
+- config_schema
+- _self_
+
+seed: 1
+seq_len: 64
+examples: 4096
+border_length: 224
+flat_tokens_config:
+  tokens_chunk_size: 32768
+  seq_starts_chunk_size: 513
+  images_chunk_size: 77070336
+output: synthetic_vl_dataset.zarr

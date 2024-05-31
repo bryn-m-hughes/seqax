@@ -1,5 +1,5 @@
-# Command to run on your CPU:
-#   XLA_FLAGS=--xla_force_host_platform_device_count=8 python -m train --config-name=local_test_synthetic
+# Command to run:
+#   python -m train --config-name=remote_cpu_test_synthetic
 
 defaults:
 - base
@@ -12,6 +12,7 @@ training:
   tokens:
     batch: 64
     len: 64
+  queue: '0c4c80fa11774fd79efb60c7d8e16e52'
 
 model:
   d_model: 256
@@ -25,7 +26,7 @@ model:
   rope_max_timescale: 256
 
 paths:
-  root_working_dir: '/tmp'
+  root_working_dir: 'gs://lam-train-artifacts'
   model_name: 'synthetic_000'
 
 checkpoint_interval: 10

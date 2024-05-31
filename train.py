@@ -4,7 +4,7 @@ import os
 import time
 
 import env
-env.set_variables()
+env.set_variables(cpu=True)
 import shardlib.shardtypes as shardtypes
 shardtypes.register_with_typeguard()
 import gcsfs  # Needed for clearml setup
@@ -20,7 +20,7 @@ from jax import lax
 from jax.sharding import PartitionSpec
 import jax.numpy as jnp
 import math
-from input_loader import FlatTokensParams, HuggingFaceDataParams, TokenBatch, TokenBatchParams, get_loader
+from input_loader import FlatTokensParams, HuggingFaceDataParams, TokenBatch, TokenBatchParams, ImageBatch, get_loader
 from shardlib.shardtypes import bf16, bool_, f32, pytree_dataclass, u32, make_shardings
 import shardlib.shardops as shardops
 P = PartitionSpec
@@ -33,6 +33,8 @@ from clearml import Task
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh
 from jax.tree_util import tree_leaves
+import clip_jax
+from clip_jax.clip import preprocess_images
 
 PRNGKey = Any
 
@@ -46,7 +48,10 @@ class Hparams:
   vocab: int
   d_ff: int
   rope_max_timescale: int
+  d_visual: int
 
+image_fn = None
+jax_params = None
 
 @pytree_dataclass
 class Model:
@@ -60,6 +65,7 @@ class Model:
   w_gate: f32['layers d_model/d d_ff/t']
   w_up: f32['layers d_model/d d_ff/t']
   w_down: f32['layers d_model/d d_ff/t']
+  w_vis: f32['d_visual/t d_model/d']
   final_layer_norm: f32['d_model/d/t']
 
   @staticmethod
@@ -86,6 +92,7 @@ class Model:
     w_up_scale = d_model_scale
     w_down_scale = 1 / (math.sqrt(h.d_ff) * truncated_normal_stddev)
     unembed_scale = d_model_scale
+    w_vis_scale = d_model_scale
 
     w_kv_shape = (h.layers, 2, h.d_model, h.n_kv, h.d_head)
     w_kv = w_kv_scale * jax.random.truncated_normal(fold_in_str(rng, 'w_kv'), -2, 2, w_kv_shape, dtype=jnp.float32)
@@ -95,6 +102,8 @@ class Model:
     w_kv = w_kv_scale * jax.random.truncated_normal(fold_in_str(rng, 'w_kv'), -2, 2, w_kv_shape, dtype=jnp.float32)
     w_o_shape = w_q_shape
     w_o = w_o_scale * jax.random.truncated_normal(fold_in_str(rng, 'w_o'), -2, 2, w_o_shape, dtype=jnp.float32)
+    w_vis_shape = (h.d_visual, h.d_model)
+    w_vis = w_vis_scale * jax.random.truncated_normal(fold_in_str(rng, 'w_vis'), -2, 2, w_vis_shape, dtype=jnp.float32)
 
     ff_shape = (h.layers, h.d_model, h.d_ff)
     w_gate = w_up_scale * jax.random.truncated_normal(fold_in_str(rng, 'w_gate'), -2, 2, ff_shape, dtype=jnp.float32)
@@ -113,6 +122,7 @@ class Model:
       w_gate=w_gate,
       w_up=w_up,
       w_down=w_down,
+      w_vis=w_vis,
       final_layer_norm=final_layer_norm,
     )
     shardings = make_shardings(Model)
@@ -120,11 +130,22 @@ class Model:
 
 
   @typechecked
-  def forward_pass(self, h: Hparams, ids: u32[b'B/d L'], is_seq_start: bool_[b'B/d L']) -> f32[b'B/d L V/t']:
+  def forward_pass(self, h: Hparams, ids: u32[b'B/d L'], is_seq_start: bool_[b'B/d L'], images: ImageBatch) -> f32[b'B/d L V/t']:
+    ##### Image embedding and projection.
+    images_to_embed = images.images.reshape(-1, 3, 224, 224).astype(jnp.float32)
+    img_emb = image_fn(jax_params, preprocess_images(images_to_embed))
+    w_vis = shardops.all_gather('v/t m/d -> v m', self.w_vis)
+    proj_img_emb = jnp.dot(img_emb, w_vis)
+
     ##### Initial embedding lookup.
     embed = shardops.all_gather('V/t M/d -> V/t M', jnp.bfloat16(self.embed))
     x = shardops.index_unreduced('[V/t] M, B/d L -> B/d L M', embed, ids)
-    x = shardops.psum_scatter('B/d L M -> B/d L M/t', x)
+    # Insert image embeddings.
+    x = shardops.all_gather('B/d L M -> B L M', x)
+    x_like_imgs = jnp.zeros_like(x).astype(jnp.float32)
+    x_like_imgs.at[images.batch_indices, images.seq_offsets].set(proj_img_emb)
+    x = jnp.where(x_like_imgs != 0, x_like_imgs, x)
+    x = shardops.psum_scatter('B L M -> B/d L M/t', x)
 
     L = ids.shape[1]
     segment_ids = jnp.cumsum(is_seq_start, axis=1)
@@ -207,7 +228,7 @@ class Model:
     is_seq_start: bool_[b'batch/d len'] = batch.is_seq_start
     inputs: u32[b'batch/d len'] = jnp.where(is_seq_start, 0, inputs)
 
-    logits: f32[b'batch/d len V/t'] = self.forward_pass(h, inputs, is_seq_start)
+    logits: f32[b'batch/d len V/t'] = self.forward_pass(h, inputs, is_seq_start, batch.images)
     max_logits: f32[b'batch/d len 1'] = lax.pmax(jnp.max(lax.stop_gradient(logits), axis=-1, keepdims=True), 't')
     logits = logits - max_logits
     sum_logits = lax.psum(jnp.sum(jnp.exp(logits), axis=-1, keepdims=True), 't')
@@ -455,6 +476,8 @@ def main_contained(config, logger):
 def main(config):
   config = jax_extra.make_dataclass_from_dict(Config, config)
   if config.training.queue:
+    # ClearML dependency auto-detection misses jaxlib, so we force add it here.
+    Task.add_requirements('jaxlib')
     task = Task.init(project_name='testing', task_name=config.paths.model_name)
     logger = task.get_logger()
     task.execute_remotely(queue_name=config.training.queue)
@@ -466,6 +489,8 @@ def main(config):
                         process_id=int(os.environ['RANK']))
   else:
     logger = None
+  global image_fn, jax_params
+  image_fn, _, jax_params = clip_jax.load('ViT-B/32', "cpu")
   main_contained(config, logger)
 
 
