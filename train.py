@@ -33,7 +33,6 @@ from clearml import Task
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh
 from jax.tree_util import tree_leaves
-import clip_jax
 from clip_jax.clip import preprocess_images
 
 PRNGKey = Any
@@ -490,6 +489,7 @@ def main(config):
   else:
     logger = None
   global image_fn, jax_params
+  import clip_jax
   image_fn, _, jax_params = clip_jax.load('ViT-B/32', "cpu")
   main_contained(config, logger)
 

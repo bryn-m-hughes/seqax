@@ -61,11 +61,10 @@ def _download(url: str, root: str = os.path.expanduser("~/.cache/clip")):
 
     return download_target
 
-# Normalization parameters
-mean = jnp.array([0.48145466, 0.4578275, 0.40821073])
-std = jnp.array([0.26862954, 0.26130258, 0.27577711])
-
 def normalize(image):
+    # Normalization parameters
+    mean = jnp.array([0.48145466, 0.4578275, 0.40821073])
+    std = jnp.array([0.26862954, 0.26130258, 0.27577711])
     image = image / 255.0  # Scale to [0, 1]
     mean_reshaped = mean[:, None, None]  # Reshape mean to (3, 1, 1)
     std_reshaped = std[:, None, None]    # Reshape std to (3, 1, 1)
